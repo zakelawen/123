@@ -1,0 +1,565 @@
+import os
+import json
+import requests
+import logging
+from tqdm import tqdm
+import numpy as np
+import httpx
+import faiss
+import time
+from dotenv import load_dotenv
+from openai import OpenAI
+from neo4j import GraphDatabase
+from tabulate import tabulate
+from colorama import init, Fore, Style
+
+# 初始化 Colorama
+init(autoreset=True)
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# 从模块导入（假设这些模块已正确定义）
+from four import OpenAIClient, Neo4jClient, get_or_create_index, search_similar_vectors_faiss_ip
+
+# 新的 UMLS 搜索函数从用户提供的代码中整合
+def search_umls_with_api_key(
+        api_key,
+        term,
+        input_type='atom',
+        language='ENG',
+        page_size=50,
+        search_type='words',
+        include_obsolete=False,
+        include_suppressible=False,
+        return_id_type='concept',
+        sabs=None,
+        stype=None,
+        partial_search=False,
+        max_pages=5  # 严格限制最大页数为10
+):
+    """
+    使用 UMLS API 搜索术语并返回所有分页的搜索结果，严格限制最大页数为10。
+    """
+    url = "https://uts-ws.nlm.nih.gov/rest/search/current"
+    all_results = []
+    page_number = 1
+
+    # 初始请求参数
+    params = {
+        "string": term,
+        "apiKey": api_key,
+        "inputType": input_type,
+        "language": language,
+        "pageSize": page_size,
+        "pageNumber": page_number,
+        "searchType": search_type,
+        "includeObsolete": str(include_obsolete).lower(),
+        "includeSuppressible": str(include_suppressible).lower(),
+        "returnIdType": return_id_type,
+        "partialSearch": str(partial_search).lower()
+    }
+
+    if sabs:
+        params["sabs"] = sabs
+    if stype:
+        params["stype"] = stype
+
+    try:
+        # 强制限制循环次数
+        with tqdm(total=max_pages, desc=f"搜索UMLS: {term}", unit="页") as pbar:
+            while page_number <= max_pages:  # 严格限制最大页数
+                params["pageNumber"] = page_number
+
+                try:
+                    response = requests.get(url, params=params)
+                    response.raise_for_status()
+                    data = response.json()
+                    results = data.get("result", {}).get("results", [])
+
+                    # 检查是否为空结果或到达末尾
+                    if not results or results[0].get("ui") == "NONE":
+                        break
+
+                    all_results.extend(results)
+
+                    if page_number >= max_pages:  # 再次检查是否达到最大页数
+                        break
+
+                    page_number += 1
+                    pbar.update(1)
+
+                except requests.exceptions.RequestException as e:
+                    logging.error(f"请求第 {page_number} 页时出错: {e}")
+                    break
+                except ValueError as e:
+                    logging.error(f"解析第 {page_number} 页响应时出错: {e}")
+                    break
+
+    except Exception as e:
+        logging.error(f"UMLS搜索过程出错: {e}")
+
+    finally:
+        logging.info(f"UMLS搜索完成: 共获取 {page_number} 页，{len(all_results)} 条结果")
+
+    return all_results, page_number
+
+def get_cui_definition(api_key, cui):
+    """
+    使用 UMLS API 获取指定 CUI 的定义。
+    """
+    url = f"https://uts-ws.nlm.nih.gov/rest/content/current/CUI/{cui}/definitions"
+    params = {
+        "apiKey": api_key
+    }
+
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+
+        results = response.json()
+        return results
+    except requests.exceptions.HTTPError as http_err:
+        logging.error(f"HTTP error occurred while fetching definitions for CUI {cui}: {http_err}")
+        return None
+    except requests.exceptions.RequestException as req_err:
+        logging.error(f"Request exception while fetching definitions for CUI {cui}: {req_err}")
+        return None
+    except ValueError as json_err:
+        logging.error(f"JSON decoding failed while fetching definitions for CUI {cui}: {json_err}")
+        return None
+
+# 初始化 CUI 定义缓存
+cui_definition_cache = {}
+
+# 配置 OpenAI 客户端
+class OpenAIClient:
+    def __init__(self, api_key: str, base_url: str = "https://api.xty.app/v1"):
+        self.client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            http_client=httpx.Client(base_url=base_url, follow_redirects=True)
+        )
+
+    def get_embedding(self, text: str):
+        """
+        获取文本的 embedding 向量
+        """
+        try:
+            response = self.client.embeddings.create(
+                model="text-embedding-3-large",
+                input=text,
+                encoding_format="float",
+            )
+            embedding = response.data[0].embedding
+            return np.array(embedding, dtype=np.float32)
+        except Exception as e:
+            print(f"获取嵌入向量时出错: {e}")
+            return None
+
+    def extract_keyentity(self, text: str):
+        """
+        提取文本中的关键医疗实体
+        """
+        prompt = f"""
+            Task:
+            Please extract all clinically significant medical entities from the following question. The extracted entities should include key symptoms, relevant medical history, important findings, and abnormalities from the physical examination. Only extract objective and clinically relevant information. Avoid extracting speculative entities (such as suspected or hypothetical diagnoses).
+
+            Example Input:
+            "A 23-year-old pregnant woman at 22 weeks gestation presents with burning upon urination. She states it started 1 day ago and has been worsening despite drinking more water and taking cranberry extract. She otherwise feels well and is followed by a doctor for her pregnancy. Her temperature is 97.7°F (36.5°C), blood pressure is 122/77 mmHg, pulse is 80/min, respirations are 19/min, and oxygen saturation is 98% on room air. Physical exam is notable for an absence of costovertebral angle tenderness and a gravid uterus."
+
+            Expected Output:
+            pregnant woman
+            burning upon urination
+            absence of costovertebral angle tenderness
+
+            The medical question is: "{text}"
+            """
+        try:
+            response = self.client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": prompt},
+                ],
+                model="gpt-4-turbo-2024-04-09"
+            )
+            entity = response.choices[0].message.content.strip()
+            return entity
+        except Exception as e:
+            print(f"处理文本时出错: {text}\n错误信息: {e}")
+            return None
+
+# 配置 Neo4j 客户端
+class Neo4jClient:
+    def __init__(self, uri, user, password):
+        self.driver = GraphDatabase.driver(uri, auth=(user, password))
+
+    def close(self):
+        self.driver.close()
+
+    def get_node_names(self, node_indices):
+        """
+        根据 node_index 列表获取对应的 node_name
+        """
+        # 确保 node_indices 是字符串列表
+        node_indices_str = [str(index) for index in node_indices]
+        with self.driver.session() as session:
+            result = session.run(
+                "MATCH (n) WHERE n.node_index IN $indices RETURN n.node_index AS node_index, n.node_name AS node_name",
+                indices=node_indices_str
+            )
+            return {record["node_index"]: record["node_name"] for record in result}
+
+    def find_k_hop_paths_by_name(self, node_name, k):
+        """
+        基于 node_name 查找指定节点的 k 跳路径
+        """
+        total_start_time = time.time()
+
+        query = f"""
+        MATCH p = (n)-[*{k}..{k}]-(m)
+        WHERE n.node_name = $node_name
+        RETURN nodes(p) AS Nodes, relationships(p) AS Relationships
+        """
+
+        with self.driver.session() as session:
+            result = session.run(query, parameters={"node_name": node_name})
+
+            paths = []
+            for record in result:
+                nodes = [node["node_name"] if "node_name" in node else "Unknown" for node in record["Nodes"]]
+                relationships = [rel.type if rel else "Unknown" for rel in record["Relationships"]]
+
+                path = []
+                for i in range(len(relationships)):
+                    path.append(nodes[i])
+                    path.append(f"-[{relationships[i]}]->")
+                path.append(nodes[-1])
+
+                paths.append(" ".join(path))
+
+        total_end_time = time.time()
+        total_time = total_end_time - total_start_time
+
+        return paths, total_time
+
+    def find_k_hop_paths_by_index(self, node_index, k):
+        """
+        基于 node_index 查找指定节点的 k 跳路径
+        """
+        total_start_time = time.time()
+
+        query = f"""
+        MATCH p = (n)-[*{k}..{k}]-(m)
+        WHERE n.node_index = $node_index
+        RETURN nodes(p) AS Nodes, relationships(p) AS Relationships
+        """
+
+        with self.driver.session() as session:
+            result = session.run(query, parameters={"node_index": node_index})
+
+            paths = []
+            for record in result:
+                nodes = [node["node_name"] if "node_name" in node else "Unknown" for node in record["Nodes"]]
+                relationships = [rel.type if rel else "Unknown" for rel in record["Relationships"]]
+
+                path = []
+                for i in range(len(relationships)):
+                    path.append(nodes[i])
+                    path.append(f"-[{relationships[i]}]->")
+                path.append(nodes[-1])
+
+                paths.append(" ".join(path))
+
+        total_end_time = time.time()
+        total_time = total_end_time - total_start_time
+
+        return paths, total_time
+
+# FAISS 相关函数
+def load_faiss_index(index_path):
+    """
+    从文件加载 FAISS 内积索引
+    """
+    if not os.path.exists(index_path):
+        raise FileNotFoundError(f"索引文件 {index_path} 不存在。请确保路径正确并且索引已构建。")
+
+    print(f"从 {index_path} 加载 FAISS 内积索引...")
+    index = faiss.read_index(index_path)
+    print("FAISS 内积索引加载完成。")
+    return index
+
+def search_similar_vectors_faiss_ip(index, query_vector, top_k=5):
+    """
+    使用 FAISS 内积索引搜索与查询向量余弦相似度最高的 top_k 个向量。
+    """
+    # 确保查询向量为 float32 类型并归一化
+    query_vector = query_vector.astype(np.float32).reshape(1, -1)
+    faiss.normalize_L2(query_vector)
+
+    # 执行搜索，内积即余弦相似度
+    similarities, indices = index.search(query_vector, top_k)
+    return similarities[0], indices[0]
+
+def get_or_create_index(embeddings, index_path):
+    """
+    加载现有索引或创建新的内积索引并保存。
+    """
+    if os.path.exists(index_path):
+        try:
+            index = load_faiss_index(index_path)
+            return index
+        except Exception as e:
+            print(f"加载现有索引时出错: {e}")
+            print("尝试重新构建索引...")
+
+    # 如果索引不存在或加载失败，则创建新的内积索引
+    dimension = embeddings.shape[1]
+    print(f"构建内积搜索索引，向量维度: {dimension}")
+
+    # 确保嵌入向量已归一化
+    faiss.normalize_L2(embeddings)
+
+    # 使用内积进行搜索
+    index = faiss.IndexFlatIP(dimension)
+    index.add(embeddings)  # 添加向量到索引
+
+    # 保存新的索引
+    faiss.write_index(index, index_path)
+    print(f"内积索引已保存到 {index_path}")
+
+    return index
+
+# 为搜索到的术语获取详细定义
+def umls_search_and_definitions_optimized(api_key, term, max_cuis=1):
+    """
+    使用 UMLS API 搜索术语并获取其定义，限制每个术语最多返回 max_cuis 个 CUI。
+    """
+    search_results, _ = search_umls_with_api_key(
+        api_key=api_key,
+        term=term,
+        input_type="atom",
+        language="ENG",
+        page_size=50,
+        max_pages=1,
+        search_type="words",
+        include_obsolete=True,
+        include_suppressible=True,
+        return_id_type="concept",
+        partial_search=False
+    )
+
+    detailed_results = []
+
+    if search_results:
+        # 仅处理前 max_cuis 个 CUI
+        for result in search_results[:max_cuis]:
+            cui = result.get("ui")
+            name = result.get("name")
+            root_source = result.get("rootSource")
+            uri = result.get("uri")
+
+            definitions = []
+            if cui:
+                # 获取所有定义，不限制数量
+                definition_results = get_cui_definition(api_key, cui)
+                if definition_results and "result" in definition_results:
+                    for definition in definition_results["result"]:
+                        source = definition.get("rootSource", "未知来源")
+                        value = definition.get("value", "无定义内容")
+                        definitions.append({"source": source, "definition": value})
+
+            # 仅在有定义的情况下添加
+            if definitions:
+                detailed_results.append({
+                    "cui": cui,
+                    "name": name,
+                    "root_source": root_source,
+                    "uri": uri,
+                    "definitions": definitions
+                })
+
+    return detailed_results
+
+# 新增辅助函数
+def is_empty_result(umls_results, cypher_paths):
+    """
+    判断UMLS结果和Cypher路径是否为空
+    """
+    return (not umls_results) or (not cypher_paths)
+
+# 在处理每个实体和节点时调用 UMLS 查询
+def process_jsonl(input_file_path, openai_client, faiss_index, node_indices, embeddings, neo4j_client, k,
+                  target_lines=None, api_key=None):
+    target_set = set(target_lines) if target_lines else None
+
+    with open(input_file_path, 'r', encoding='utf-8') as infile:
+        for current_line_num, line in enumerate(tqdm(infile, desc="处理指定行"), start=1):
+            if target_set and current_line_num not in target_set:
+                continue
+            try:
+                data = json.loads(line)
+                question_text = data.get("question", "")
+                if question_text:
+                    entities = openai_client.extract_keyentity(question_text)
+                    if entities:
+                        print(f"\n{Fore.CYAN}行号: {current_line_num}{Style.RESET_ALL}")
+                        print(f"{Fore.BLUE}问题: {question_text}{Style.RESET_ALL}")
+                        print(f"{Fore.MAGENTA}提取的实体:\n{entities}\n{Style.RESET_ALL}")
+
+                        for entity in entities.split('\n'):
+                            entity = entity.strip()
+                            if entity:
+                                print(f"\n{'='*50}")
+                                print(f"{Fore.CYAN}处理实体: {entity}{Style.RESET_ALL}")
+                                print(f"{'-'*50}")
+
+                                # UMLS 查询
+                                entity_definitions = umls_search_and_definitions_optimized(api_key, entity, max_cuis=1)
+                                if entity_definitions:
+                                    print(f"{Fore.GREEN}UMLS 查询结果:{Style.RESET_ALL}")
+                                    umls_table = []
+                                    for def_item in entity_definitions:
+                                        cui = def_item['cui']
+                                        name = def_item['name']
+                                        for definition in def_item['definitions']:
+                                            source = definition['source']
+                                            value = definition['definition']
+                                            umls_table.append([cui, name, source, value])
+                                    print(tabulate(umls_table, headers=["CUI", "名称", "来源", "定义"], tablefmt="grid"))
+                                else:
+                                    print(f"{Fore.YELLOW}UMLS 查询结果: 无定义结果。{Style.RESET_ALL}")
+
+                                # Cypher 查询
+                                paths, cypher_exec_time = neo4j_client.find_k_hop_paths_by_name(entity, k)
+                                if paths:
+                                    print(f"{Fore.GREEN}Cypher 查询结果 ({cypher_exec_time:.4f} 秒):{Style.RESET_ALL}")
+                                    cypher_table = [[path] for path in paths]
+                                    print(tabulate(cypher_table, headers=["路径"], tablefmt="grid"))
+                                else:
+                                    print(f"{Fore.YELLOW}Cypher 查询结果: 无路径结果。{Style.RESET_ALL}")
+
+                                # 检查 UMLS 和 Cypher 查询结果
+                                if is_empty_result(entity_definitions, paths):
+                                    print(f"{Fore.RED}实体 '{entity}' 在 UMLS 或 Cypher 查询中未找到信息。进行相似度搜索...{Style.RESET_ALL}")
+
+                                    # 获取实体的嵌入向量
+                                    entity_embedding = openai_client.get_embedding(entity)
+                                    if entity_embedding is None:
+                                        print(f"{Fore.RED}无法获取实体的嵌入向量: {entity}{Style.RESET_ALL}")
+                                        continue
+
+                                    # FAISS 搜索
+                                    similarities, indices = search_similar_vectors_faiss_ip(
+                                        faiss_index,
+                                        entity_embedding,
+                                        top_k=5
+                                    )
+                                    print(f"\n{Fore.CYAN}相似度最高的节点 (FAISS 内积搜索):{Style.RESET_ALL}")
+                                    faiss_table = []
+                                    for i in range(len(indices)):
+                                        node_id = node_indices[indices[i]]
+                                        similarity = similarities[i]
+                                        faiss_table.append([f"Top {i + 1}", node_id, f"{similarity:.4f}"])
+                                    print(tabulate(faiss_table, headers=["排名", "节点 ID", "余弦相似度"], tablefmt="fancy_grid"))
+
+                                    # 处理相似度最高的节点
+                                    for node_id, similarity in zip(indices, similarities):
+                                        node_id_str = node_indices[node_id]
+                                        node_name = neo4j_client.get_node_names([node_id_str]).get(node_id_str, "未找到对应的node_name")
+                                        print(f"\n{Fore.BLUE}节点 ID = {node_id_str}, 节点名称 = {node_name}, 相似度 = {similarity:.4f}{Style.RESET_ALL}")
+
+                                        if similarity < 0.9 and node_id_str != node_indices[indices[0]]:
+                                            continue
+
+                                        # 获取节点的 UMLS 定义
+                                        node_definitions = umls_search_and_definitions_optimized(api_key, node_name, max_cuis=1)
+                                        if node_definitions:
+                                            print(f"{Fore.GREEN}节点 '{node_name}' 的定义:{Style.RESET_ALL}")
+                                            node_umls_table = []
+                                            for def_item in node_definitions:
+                                                cui = def_item['cui']
+                                                name = def_item['name']
+                                                for definition in def_item['definitions']:
+                                                    source = definition['source']
+                                                    value = definition['definition']
+                                                    node_umls_table.append([cui, name, source, value])
+                                            print(tabulate(node_umls_table, headers=["CUI", "名称", "来源", "定义"], tablefmt="grid"))
+
+                                        # 获取节点的 k 跳路径
+                                        node_paths, node_cypher_time = neo4j_client.find_k_hop_paths_by_index(node_id_str, k)
+                                        if node_paths:
+                                            print(f"{Fore.GREEN}为节点 '{node_name}' 找到 {len(node_paths)} 条 {k} 跳路径 ({node_cypher_time:.4f} 秒):{Style.RESET_ALL}")
+                                            node_cypher_table = [[path] for path in node_paths]
+                                            print(tabulate(node_cypher_table, headers=["路径"], tablefmt="grid"))
+                                        else:
+                                            print(f"{Fore.YELLOW}为节点 '{node_name}' 未找到路径。{Style.RESET_ALL}")
+
+                                        if node_id_str == node_indices[indices[0]]:
+                                            break
+                                else:
+                                    # 如果 UMLS 和 Cypher 都有结果，直接显示
+                                    print(f"{Fore.GREEN}实体 '{entity}' 的 UMLS 定义:{Style.RESET_ALL}")
+                                    print(tabulate(umls_table, headers=["CUI", "名称", "来源", "定义"], tablefmt="grid"))
+
+                                    print(f"{Fore.GREEN}实体 '{entity}' 的 {k} 跳路径:{Style.RESET_ALL}")
+                                    print(tabulate(cypher_table, headers=["路径"], tablefmt="grid"))
+
+                                print("\n" + "-" * 50 + "\n")
+            except json.JSONDecodeError as jde:
+                print(f"{Fore.RED}行 {current_line_num} JSON 解码错误: {jde}{Style.RESET_ALL}")
+            except Exception as e:
+                print(f"{Fore.RED}行 {current_line_num} 发生意外错误: {e}{Style.RESET_ALL}")
+
+            if target_set and current_line_num >= max(target_set):
+                break
+
+    print("处理完成。")
+
+# 示例用法
+if __name__ == "__main__":
+    # 从环境变量加载 API Key
+    load_dotenv()  # 确保 .env 文件被加载
+    openai_api_key = "sk-s5TcNwpkCK7VSmnaCa59C2E37b7346279d839f427e35C458"
+    if not openai_api_key:
+        print(f"{Fore.RED}未找到 OPENAI_API_KEY，请在 .env 文件中设置。{Style.RESET_ALL}")
+        exit(1)
+    api_key = "0823ae3b-da1a-4dad-a683-b9d1ef353414"
+    if not api_key:
+        print(f"{Fore.RED}未找到 UMLS_API_KEY，请在 .env 文件中设置。{Style.RESET_ALL}")
+        exit(1)
+
+    # 其他配置
+    faiss_index_path = "/home/user1/zjs/实验/实验/import/faiss_index_flat_ip.index"
+    node_indices_npy = "/home/user1/zjs/实验/实验/import/node_indices.npy"
+    embeddings_npy = "/home/user1/zjs/实验/实验/import/embeddings.npy"
+    input_jsonl = "/home/user1/zjs/实验/实验/MedQAdata/train.jsonl"
+
+    # 加载 node_indices 确保它们是字符串
+    node_indices = np.load(node_indices_npy).astype(str)
+    embeddings = np.load(embeddings_npy).astype(np.float32)
+
+    # 加载或创建 FAISS 索引
+    faiss_index = get_or_create_index(embeddings, faiss_index_path)
+
+    openai_client = OpenAIClient(api_key=openai_api_key)
+    neo4j_client = Neo4jClient(uri="neo4j://localhost:7687", user="neo4j", password="12345678")
+
+    k = 1  # 设置跳数
+    target_line_numbers = [3]  # 可以设置为特定行号列表
+
+    try:
+        # 处理指定行
+        process_jsonl(
+            input_file_path=input_jsonl,
+            openai_client=openai_client,
+            faiss_index=faiss_index,
+            node_indices=node_indices,
+            embeddings=embeddings,
+            neo4j_client=neo4j_client,
+            k=k,
+            target_lines=target_line_numbers,
+            api_key=api_key  # 传递 UMLS API Key
+        )
+    finally:
+        neo4j_client.close()
